@@ -1,0 +1,185 @@
+import cv2
+import time
+import numpy as np
+import os
+from datetime import datetime
+
+# Configuration
+IR_THRESHOLD = 230
+EXPECTED_INTERVAL = 0.0667  # 15Hz (~66.7ms between bits)
+NUM_BITS_TO_COLLECT = 6
+TIMING_TOLERANCE = 0.020  # ±20ms tolerance for bit timing
+MIN_PULSE_WIDTH = 0.010  # Minimum duration for a valid pulse
+
+# Known IR patterns
+known_patterns = {
+    "Player 1": [1, 1, 0, 0, 1, 0],
+    "Player 2": [1, 1, 0, 1, 0, 0],
+    "Custom 110110": [1, 1, 0, 1, 1, 0],
+}
+
+def detect_bit_and_position(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    max_val = np.max(gray)
+    bit = 1 if max_val > IR_THRESHOLD else 0
+    position = None
+    if bit == 1:
+        max_pos = np.unravel_index(np.argmax(gray), gray.shape)
+        position = (max_pos[1], max_pos[0])  # (x, y)
+    return bit, position, gray
+
+def create_pattern_folder(session_dir, pattern_number):
+    pattern_path = os.path.join(session_dir, f"pattern_{pattern_number}")
+    os.makedirs(pattern_path, exist_ok=True)
+    dirs = []
+    for i in range(1, NUM_BITS_TO_COLLECT + 1):
+        bit_path = os.path.join(pattern_path, f"bit_{i}")
+        os.makedirs(bit_path, exist_ok=True)
+        dirs.append(bit_path)
+    return pattern_path, dirs
+
+def save_gray_frame(gray, folder, bit_index):
+    img_name = f"bit{bit_index}_{datetime.now().strftime('%H%M%S_%f')}.png"
+    path = os.path.join(folder, img_name)
+    cv2.imwrite(path, gray)
+
+def is_valid_timing(delta_t, expected_interval):
+    return abs(delta_t - expected_interval) <= TIMING_TOLERANCE
+
+def match_pattern(bits):
+    for name, pattern in known_patterns.items():
+        if bits == pattern:
+            return name
+    return None
+
+def main():
+    # Initialize camera
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 60)
+
+    # Session folder
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    session_dir = f"ir_session_{timestamp}"
+    os.makedirs(session_dir, exist_ok=True)
+    
+    print(f"Monitoring for double IR pulse... Press 'q' to quit.\nSaving frames to: {session_dir}")
+
+    collecting = False
+    pattern_counter = 1
+    collected_bits = []
+    bit_positions = []
+    bit_timestamps = []
+    current_pattern_dir = None
+    bit_dirs = []
+    measured_interval = EXPECTED_INTERVAL
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame.")
+                break
+
+            bit, position, gray = detect_bit_and_position(frame)
+
+            # Display
+            status = f"Collecting {len(collected_bits)}/{NUM_BITS_TO_COLLECT}" if collecting else "Waiting"
+            cv2.putText(gray, f"Status: {status}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, 255, 2)
+            cv2.imshow("IR Detection View", gray)
+
+            current_time = time.perf_counter()
+
+            if not collecting:
+                if bit == 1:
+                    # Wait for the second pulse
+                    pulse_start = current_time
+                    while time.perf_counter() - pulse_start < MIN_PULSE_WIDTH:
+                        pass
+                    
+                    # Check for second pulse
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                        
+                    second_bit, second_position, second_gray = detect_bit_and_position(frame)
+                    if second_bit == 1:
+                        # Measure actual interval between pulses
+                        measured_interval = time.perf_counter() - pulse_start
+                        print(f"Measured pulse interval: {measured_interval:.4f} sec")
+                        
+                        collecting = True
+                        collected_bits = [1, 1]
+                        bit_positions = [position, second_position]
+                        bit_timestamps = [pulse_start, time.perf_counter()]
+
+                        # Create folder for this pattern
+                        current_pattern_dir, bit_dirs = create_pattern_folder(session_dir, pattern_counter)
+                        print(f"\n📂 Started pattern_{pattern_counter} in {current_pattern_dir}")
+                        print(f"Using measured interval: {measured_interval:.4f} sec")
+
+                        # Save first two bits
+                        save_gray_frame(gray, bit_dirs[0], 1)
+                        save_gray_frame(second_gray, bit_dirs[1], 2)
+
+                        print(f"🕒 Bit 1: 1, Δt = 0.0000 sec")
+                        print(f"🕒 Bit 2: 1, Δt = {measured_interval:.4f} sec")
+
+                        # Schedule next sample
+                        next_sample_time = bit_timestamps[1] + measured_interval
+            else:
+                if time.perf_counter() >= next_sample_time:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                        
+                    sample_time = time.perf_counter()
+                    bit, position, gray = detect_bit_and_position(frame)
+                    
+                    delta_t = sample_time - bit_timestamps[-1]
+                    
+                    if is_valid_timing(delta_t, measured_interval):
+                        collected_bits.append(bit)
+                        bit_positions.append(position)
+                        bit_timestamps.append(sample_time)
+
+                        index = len(collected_bits)
+                        save_gray_frame(gray, bit_dirs[index - 1], index)
+
+                        print(f"🕒 Bit {index}: {bit}, Δt = {delta_t:.4f} sec")
+
+                        # Schedule next sample
+                        next_sample_time = sample_time + measured_interval
+
+                        if len(collected_bits) == NUM_BITS_TO_COLLECT:
+                            print(f"\n✅ Detected pattern: {collected_bits}")
+                            pattern_name = match_pattern(collected_bits)
+                            if pattern_name:
+                                for i in reversed(range(len(collected_bits))):
+                                    if collected_bits[i] == 1 and bit_positions[i]:
+                                        px, py = bit_positions[i]
+                                        print(f"👤 {pattern_name} triggered at position: x={px}, y={py}")
+                                        break
+                            else:
+                                print("❌ No matching pattern found.")
+
+                            collecting = False
+                            pattern_counter += 1
+                    else:
+                        print(f"⚠️ Timing error: Δt = {delta_t:.4f} sec (expected ~{measured_interval:.4f})")
+                        collecting = False
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        print("Stopped by user.")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print(f"\n🗂️ Saved all IR pattern folders inside: {session_dir}")
+
+if __name__ == "__main__":
+    main()
